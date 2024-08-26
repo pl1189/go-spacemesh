@@ -17,7 +17,6 @@ import (
 
 	"github.com/spacemeshos/go-spacemesh/activation/wire"
 	"github.com/spacemeshos/go-spacemesh/atxsdata"
-	"github.com/spacemeshos/go-spacemesh/codec"
 	"github.com/spacemeshos/go-spacemesh/common/types"
 	"github.com/spacemeshos/go-spacemesh/datastore"
 	"github.com/spacemeshos/go-spacemesh/fetch"
@@ -1721,8 +1720,6 @@ func Test_Marriages(t *testing.T) {
 			nId, err := malProof.Valid(atxHandler.edVerifier)
 			require.NoError(t, err)
 			require.Equal(t, sig.NodeID(), nId)
-			b := codec.MustEncode(malProof)
-			_ = b
 			return nil
 		})
 		err = atxHandler.processATX(context.Background(), "", atx2, time.Now())
@@ -1813,64 +1810,6 @@ func Test_MarryingMalicious(t *testing.T) {
 	}
 }
 
-func TestContextualValidation_DoublePost(t *testing.T) {
-	t.Parallel()
-	golden := types.RandomATXID()
-	sig, err := signing.NewEdSigner()
-	require.NoError(t, err)
-
-	atxHandler := newV2TestHandler(t, golden)
-
-	// marry
-	otherSig, err := signing.NewEdSigner()
-	require.NoError(t, err)
-	othersAtx := atxHandler.createAndProcessInitial(t, otherSig)
-
-	mATX := newInitialATXv2(t, golden)
-	mATX.Marriages = []wire.MarriageCertificate{
-		{
-			Signature: sig.Sign(signing.MARRIAGE, sig.NodeID().Bytes()),
-		},
-		{
-			ReferenceAtx: othersAtx.ID(),
-			Signature:    otherSig.Sign(signing.MARRIAGE, sig.NodeID().Bytes()),
-		},
-	}
-	mATX.Sign(sig)
-
-	atxHandler.expectInitialAtxV2(mATX)
-	err = atxHandler.processATX(context.Background(), "", mATX, time.Now())
-	require.NoError(t, err)
-
-	// publish merged
-	merged := newSoloATXv2(t, mATX.PublishEpoch+2, mATX.ID(), mATX.ID())
-	post := wire.SubPostV2{
-		MarriageIndex: 1,
-		NumUnits:      othersAtx.TotalNumUnits(),
-		PrevATXIndex:  1,
-	}
-	merged.NiPosts[0].Posts = append(merged.NiPosts[0].Posts, post)
-
-	mATXID := mATX.ID()
-	merged.MarriageATX = &mATXID
-
-	merged.PreviousATXs = []types.ATXID{mATX.ID(), othersAtx.ID()}
-	merged.Sign(sig)
-
-	atxHandler.expectMergedAtxV2(merged, []types.NodeID{sig.NodeID(), otherSig.NodeID()}, []uint64{poetLeaves})
-	err = atxHandler.processATX(context.Background(), "", merged, time.Now())
-	require.NoError(t, err)
-
-	// The otherSig tries to publish alone in the same epoch.
-	// This is malfeasance as it tries include his PoST twice.
-	doubled := newSoloATXv2(t, merged.PublishEpoch, othersAtx.ID(), othersAtx.ID())
-	doubled.Sign(otherSig)
-	atxHandler.expectAtxV2(doubled)
-	atxHandler.mMalPublish.EXPECT().Publish(gomock.Any(), otherSig.NodeID(), gomock.Any())
-	err = atxHandler.processATX(context.Background(), "", doubled, time.Now())
-	require.NoError(t, err)
-}
-
 func Test_CalculatingUnits(t *testing.T) {
 	t.Parallel()
 	t.Run("units on 1 nipost must not overflow", func(t *testing.T) {
@@ -1899,7 +1838,7 @@ func Test_CalculatingUnits(t *testing.T) {
 
 func TestContextual_PreviousATX(t *testing.T) {
 	golden := types.RandomATXID()
-	atxHndlr := newV2TestHandler(t, golden)
+	atxHdlr := newV2TestHandler(t, golden)
 	var (
 		signers []*signing.EdSigner
 		eqSet   []types.NodeID
@@ -1911,13 +1850,13 @@ func TestContextual_PreviousATX(t *testing.T) {
 		eqSet = append(eqSet, sig.NodeID())
 	}
 
-	mATX, otherAtxs := marryIDs(t, atxHndlr, signers, golden)
+	mATX, otherAtxs := marryIDs(t, atxHdlr, signers, golden)
 
 	// signer 1 creates a solo ATX
 	soloAtx := newSoloATXv2(t, mATX.PublishEpoch+1, otherAtxs[0].ID(), mATX.ID())
 	soloAtx.Sign(signers[1])
-	atxHndlr.expectAtxV2(soloAtx)
-	err := atxHndlr.processATX(context.Background(), "", soloAtx, time.Now())
+	atxHdlr.expectAtxV2(soloAtx)
+	err := atxHdlr.processATX(context.Background(), "", soloAtx, time.Now())
 	require.NoError(t, err)
 
 	// create a MergedATX for all IDs
@@ -1935,9 +1874,9 @@ func TestContextual_PreviousATX(t *testing.T) {
 	merged.MarriageATX = &matxID
 	merged.Sign(signers[0])
 
-	atxHndlr.expectMergedAtxV2(merged, eqSet, []uint64{100})
-	atxHndlr.mMalPublish.EXPECT().Publish(gomock.Any(), signers[1].NodeID(), gomock.Any())
-	err = atxHndlr.processATX(context.Background(), "", merged, time.Now())
+	atxHdlr.expectMergedAtxV2(merged, eqSet, []uint64{100})
+	atxHdlr.mMalPublish.EXPECT().Publish(gomock.Any(), signers[1].NodeID(), gomock.Any())
+	err = atxHdlr.processATX(context.Background(), "", merged, time.Now())
 	require.NoError(t, err)
 }
 

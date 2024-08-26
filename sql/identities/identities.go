@@ -7,9 +7,7 @@ import (
 
 	sqlite "github.com/go-llsqlite/crawshaw"
 
-	"github.com/spacemeshos/go-spacemesh/codec"
 	"github.com/spacemeshos/go-spacemesh/common/types"
-	"github.com/spacemeshos/go-spacemesh/malfeasance/wire"
 	"github.com/spacemeshos/go-spacemesh/sql"
 )
 
@@ -49,35 +47,6 @@ func IsMalicious(db sql.Executor, nodeID types.NodeID) (bool, error) {
 	return rows > 0, nil
 }
 
-// GetMalfeasanceProof returns the malfeasance proof for the given identity.
-func GetMalfeasanceProof(db sql.Executor, nodeID types.NodeID) (*wire.MalfeasanceProof, error) {
-	var (
-		data     []byte
-		received time.Time
-	)
-	rows, err := db.Exec("select proof, received from identities where pubkey = ?1 AND proof IS NOT NULL;",
-		func(stmt *sql.Statement) {
-			stmt.BindBytes(1, nodeID.Bytes())
-		}, func(stmt *sql.Statement) bool {
-			data = make([]byte, stmt.ColumnLen(0))
-			stmt.ColumnBytes(0, data[:])
-			received = time.Unix(0, stmt.ColumnInt64(1)).Local()
-			return true
-		})
-	if err != nil {
-		return nil, fmt.Errorf("proof %v: %w", nodeID, err)
-	}
-	if rows == 0 {
-		return nil, sql.ErrNotFound
-	}
-	var proof wire.MalfeasanceProof
-	if err = codec.Decode(data, &proof); err != nil {
-		return nil, err
-	}
-	proof.SetReceived(received.Local())
-	return &proof, nil
-}
-
 // GetBlobSizes returns the sizes of the blobs corresponding to malfeasance proofs for the
 // specified identities. For non-existent proofs, the corresponding items are set to -1.
 func GetBlobSizes(db sql.Executor, ids [][]byte) (sizes []int, err error) {
@@ -85,8 +54,12 @@ func GetBlobSizes(db sql.Executor, ids [][]byte) (sizes []int, err error) {
 }
 
 // LoadMalfeasanceBlob returns the malfeasance proof in raw bytes for the given identity.
-func LoadMalfeasanceBlob(ctx context.Context, db sql.Executor, nodeID []byte, blob *sql.Blob) error {
-	return sql.LoadBlob(db, "select proof from identities where pubkey = ?1;", nodeID, blob)
+func LoadMalfeasanceBlob(_ context.Context, db sql.Executor, nodeID []byte, blob *sql.Blob) error {
+	err := sql.LoadBlob(db, "select proof from identities where pubkey = ?1;", nodeID, blob)
+	if err == nil && len(blob.Bytes) == 0 {
+		return sql.ErrNotFound
+	}
+	return err
 }
 
 // IterateMalicious invokes the specified callback for each malicious node ID.
