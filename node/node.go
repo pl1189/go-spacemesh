@@ -54,6 +54,7 @@ import (
 	"github.com/spacemeshos/go-spacemesh/hare3"
 	"github.com/spacemeshos/go-spacemesh/hare3/compat"
 	"github.com/spacemeshos/go-spacemesh/hare3/eligibility"
+	"github.com/spacemeshos/go-spacemesh/hare4"
 	"github.com/spacemeshos/go-spacemesh/hash"
 	"github.com/spacemeshos/go-spacemesh/layerpatrol"
 	"github.com/spacemeshos/go-spacemesh/log"
@@ -75,8 +76,10 @@ import (
 	"github.com/spacemeshos/go-spacemesh/sql/atxs"
 	"github.com/spacemeshos/go-spacemesh/sql/layers"
 	"github.com/spacemeshos/go-spacemesh/sql/localsql"
+	localmigrations "github.com/spacemeshos/go-spacemesh/sql/localsql/migrations"
 	dbmetrics "github.com/spacemeshos/go-spacemesh/sql/metrics"
-	"github.com/spacemeshos/go-spacemesh/sql/migrations"
+	"github.com/spacemeshos/go-spacemesh/sql/statesql"
+	statemigrations "github.com/spacemeshos/go-spacemesh/sql/statesql/migrations"
 	"github.com/spacemeshos/go-spacemesh/syncer"
 	"github.com/spacemeshos/go-spacemesh/syncer/atxsync"
 	"github.com/spacemeshos/go-spacemesh/syncer/blockssync"
@@ -145,12 +148,15 @@ func GetCommand() *cobra.Command {
 				return err
 			}
 
-			app := New(
-				WithConfig(&conf),
-				// NOTE(dshulyak) this needs to be max level so that child logger can can be current level or below.
-				// otherwise it will fail later when child logger will try to increase level.
-				WithLog(log.NewWithLevel("node", zap.NewAtomicLevelAt(zap.DebugLevel), events.EventHook())),
-			)
+			// NOTE(dshulyak) this needs to be max level so that child logger can can be current level or below.
+			// otherwise it will fail later when child logger will try to increase level.
+			encoder := zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig())
+			if conf.LOGGING.Encoder == config.JSONLogEncoder {
+				encoder = zapcore.NewJSONEncoder(zap.NewDevelopmentEncoderConfig())
+			}
+			lg := log.NewWithLevel("node", zap.NewAtomicLevelAt(zap.DebugLevel), encoder, events.EventHook())
+
+			app := New(WithConfig(&conf), WithLog(lg))
 
 			// os.Interrupt for all systems, especially windows, syscall.SIGTERM is mainly for docker.
 			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -246,10 +252,6 @@ func configure(c *cobra.Command, configPath string, conf *config.Config) error {
 		return fmt.Errorf("parsing flags: %w", err)
 	}
 
-	if conf.LOGGING.Encoder == config.JSONLogEncoder {
-		log.JSONLog(true)
-	}
-
 	if cmd.NoMainNet && onMainNet(conf) && !conf.NoMainOverride {
 		return errors.New("this is a testnet-only build not intended for mainnet")
 	}
@@ -257,15 +259,7 @@ func configure(c *cobra.Command, configPath string, conf *config.Config) error {
 	return nil
 }
 
-var (
-	appLog  log.Log
-	grpclog grpc_logsettable.SettableLoggerV2
-)
-
-func init() {
-	appLog = log.NewNop()
-	grpclog = grpc_logsettable.ReplaceGrpcLoggerV2()
-}
+var grpcLog = grpc_logsettable.ReplaceGrpcLoggerV2()
 
 // loadConfig loads config and preset (if provided) into the provided config.
 // It first loads the preset and then overrides it with values from the config file.
@@ -354,7 +348,7 @@ func New(opts ...Option) *App {
 	defaultConfig := config.DefaultConfig()
 	app := &App{
 		Config:       &defaultConfig,
-		log:          appLog,
+		log:          log.NewNop(),
 		loggers:      make(map[string]*zap.AtomicLevel),
 		grpcServices: make(map[grpcserver.Service]grpcserver.ServiceAPI),
 		started:      make(chan struct{}),
@@ -379,10 +373,10 @@ type App struct {
 	fileLock          *flock.Flock
 	signers           []*signing.EdSigner
 	Config            *config.Config
-	db                *sql.Database
+	db                sql.StateDatabase
 	cachedDB          *datastore.CachedDB
 	dbMetrics         *dbmetrics.DBMetricsCollector
-	localDB           *localsql.Database
+	localDB           sql.LocalDatabase
 	grpcPublicServer  *grpcserver.Server
 	grpcPrivateServer *grpcserver.Server
 	grpcPostServer    *grpcserver.Server
@@ -398,6 +392,8 @@ type App struct {
 	atxsdata          *atxsdata.Data
 	clock             *timesync.NodeClock
 	hare3             *hare3.Hare
+	hare4             *hare4.Hare
+	hareResultsChan   chan hare4.ConsensusOutput
 	hOracle           *eligibility.Oracle
 	blockGen          *blocks.Generator
 	certifier         *blocks.Certifier
@@ -618,7 +614,7 @@ func (app *App) initServices(ctx context.Context) error {
 	cfg.GenesisID = app.Config.Genesis.GenesisID()
 	state := vm.New(app.db,
 		vm.WithConfig(cfg),
-		vm.WithLogger(app.addLogger(VMLogger, lg)))
+		vm.WithLogger(app.addLogger(VMLogger, lg).Zap()))
 	app.conState = txs.NewConservativeState(state, app.db,
 		txs.WithCSConfig(txs.CSConfig{
 			BlockGasLimit:     app.Config.BlockGasLimit,
@@ -771,7 +767,7 @@ func (app *App) initServices(ctx context.Context) error {
 		vrfVerifier,
 		app.Config.LayersPerEpoch,
 		eligibility.WithConfig(app.Config.HareEligibility),
-		eligibility.WithLogger(app.addLogger(HareOracleLogger, lg)),
+		eligibility.WithLogger(app.addLogger(HareOracleLogger, lg).Zap()),
 	)
 	// TODO: genesisMinerWeight is set to app.Config.SpaceToCommit, because PoET ticks are currently hardcoded to 1
 
@@ -781,7 +777,7 @@ func (app *App) initServices(ctx context.Context) error {
 	app.updater = bootstrap.New(
 		app.clock,
 		bootstrap.WithConfig(bscfg),
-		bootstrap.WithLogger(app.addLogger(BootstrapLogger, lg)),
+		bootstrap.WithLogger(app.addLogger(BootstrapLogger, lg).Zap()),
 	)
 	if app.Config.Certificate.CommitteeSize == 0 {
 		app.log.With().Warning("certificate committee size is not set, defaulting to hare committee size",
@@ -864,37 +860,80 @@ func (app *App) initServices(ctx context.Context) error {
 	}
 	logger := app.addLogger(HareLogger, lg).Zap()
 
-	app.hare3 = hare3.New(
-		app.clock,
-		app.host,
-		app.db,
-		app.atxsdata,
-		proposalsStore,
-		app.edVerifier,
-		app.hOracle,
-		newSyncer,
-		patrol,
-		hare3.WithLogger(logger),
-		hare3.WithConfig(app.Config.HARE3),
-	)
-	for _, sig := range app.signers {
-		app.hare3.Register(sig)
-	}
-	app.hare3.Start()
-	app.eg.Go(func() error {
-		compat.ReportWeakcoin(
-			ctx,
-			logger,
-			app.hare3.Coins(),
-			tortoiseWeakCoin{db: app.cachedDB, tortoise: trtl},
+	// should be removed after hare4 transition is complete
+	app.hareResultsChan = make(chan hare4.ConsensusOutput, 32)
+	if app.Config.HARE3.Enable {
+		app.hare3 = hare3.New(
+			app.clock,
+			app.host,
+			app.db,
+			app.atxsdata,
+			proposalsStore,
+			app.edVerifier,
+			app.hOracle,
+			newSyncer,
+			patrol,
+			hare3.WithLogger(logger),
+			hare3.WithConfig(app.Config.HARE3),
+			hare3.WithResultsChan(app.hareResultsChan),
 		)
-		return nil
-	})
+		for _, sig := range app.signers {
+			app.hare3.Register(sig)
+		}
+		app.hare3.Start()
+		app.eg.Go(func() error {
+			compat.ReportWeakcoin(
+				ctx,
+				logger,
+				app.hare3.Coins(),
+				tortoiseWeakCoin{db: app.cachedDB, tortoise: trtl},
+			)
+			return nil
+		})
+	}
+
+	if app.Config.HARE4.Enable {
+		app.hare4 = hare4.New(
+			app.clock,
+			app.host,
+			app.db,
+			app.atxsdata,
+			proposalsStore,
+			app.edVerifier,
+			app.hOracle,
+			newSyncer,
+			patrol,
+			app.host,
+			hare4.WithLogger(logger),
+			hare4.WithConfig(app.Config.HARE4),
+			hare4.WithResultsChan(app.hareResultsChan),
+		)
+		for _, sig := range app.signers {
+			app.hare4.Register(sig)
+		}
+		app.hare4.Start()
+		app.eg.Go(func() error {
+			compat.ReportWeakcoin(
+				ctx,
+				logger,
+				app.hare4.Coins(),
+				tortoiseWeakCoin{db: app.cachedDB, tortoise: trtl},
+			)
+			return nil
+		})
+		panic("hare4 still not enabled")
+	}
+
+	propHare := &proposalConsumerHare{
+		hare3:          app.hare3,
+		h3DisableLayer: app.Config.HARE3.DisableLayer,
+		hare4:          app.hare4,
+	}
 
 	proposalListener := proposals.NewHandler(
 		app.db,
 		app.atxsdata,
-		app.hare3,
+		propHare,
 		app.edVerifier,
 		app.host,
 		fetcherWrapped,
@@ -928,7 +967,7 @@ func (app *App) initServices(ctx context.Context) error {
 			OptFilterThreshold: app.Config.OptFilterThreshold,
 			GenBlockInterval:   500 * time.Millisecond,
 		}),
-		blocks.WithHareOutputChan(app.hare3.Results()),
+		blocks.WithHareOutputChan(app.hareResultsChan),
 		blocks.WithGeneratorLogger(app.addLogger(BlockGenLogger, lg).Zap()),
 	)
 
@@ -996,7 +1035,7 @@ func (app *App) initServices(ctx context.Context) error {
 			activation.WithCertifier(certifier),
 		)
 		if err != nil {
-			app.log.Panic("failed to create poet client: %v", err)
+			app.log.Panic("failed to create poet client with address %v: %v", server.Address, err)
 		}
 		poetClients = append(poetClients, client)
 	}
@@ -1230,7 +1269,7 @@ func (app *App) initServices(ctx context.Context) error {
 		app.ptimesync = peersync.New(
 			app.host,
 			app.host,
-			peersync.WithLog(app.addLogger(TimeSyncLogger, lg)),
+			peersync.WithLog(app.addLogger(TimeSyncLogger, lg).Zap()),
 			peersync.WithConfig(app.Config.TIME.Peersync),
 		)
 	}
@@ -1512,8 +1551,7 @@ func (app *App) grpcService(svc grpcserver.Service, lg log.Log) (grpcserver.Serv
 	case v2alpha1.Network:
 		service := v2alpha1.NewNetworkService(
 			app.clock.GenesisTime(),
-			app.Config.Genesis.GenesisID(),
-			app.Config.LayerDuration)
+			app.Config)
 		app.grpcServices[svc] = service
 		return service, nil
 	case v2alpha1.Node:
@@ -1546,7 +1584,7 @@ func (app *App) grpcService(svc grpcserver.Service, lg log.Log) (grpcserver.Serv
 
 func (app *App) startAPIServices(ctx context.Context) error {
 	logger := app.addLogger(GRPCLogger, app.log)
-	grpczap.SetGrpcLoggerV2(grpclog, logger.Zap())
+	grpczap.SetGrpcLoggerV2(grpcLog, logger.Zap())
 
 	var (
 		publicSvcs        = make(map[grpcserver.Service]grpcserver.ServiceAPI, len(app.Config.API.PublicServices))
@@ -1626,7 +1664,7 @@ func (app *App) startAPIServices(ctx context.Context) error {
 		}
 		logger.With().Info("public grpc service started",
 			log.String("address", app.Config.API.PublicListener),
-			log.Array("services", log.ArrayMarshalerFunc(func(encoder log.ArrayEncoder) error {
+			log.Array("services", zapcore.ArrayMarshalerFunc(func(encoder zapcore.ArrayEncoder) error {
 				services := maps.Keys(publicSvcs)
 				slices.Sort(services)
 				for _, svc := range services {
@@ -1652,7 +1690,7 @@ func (app *App) startAPIServices(ctx context.Context) error {
 		}
 		logger.With().Info("private grpc service started",
 			log.String("address", app.Config.API.PrivateListener),
-			log.Array("services", log.ArrayMarshalerFunc(func(encoder log.ArrayEncoder) error {
+			log.Array("services", zapcore.ArrayMarshalerFunc(func(encoder zapcore.ArrayEncoder) error {
 				services := maps.Keys(privateSvcs)
 				slices.Sort(services)
 				for _, svc := range services {
@@ -1678,7 +1716,7 @@ func (app *App) startAPIServices(ctx context.Context) error {
 		}
 		logger.With().Info("post grpc service started",
 			log.String("address", app.Config.API.PostListener),
-			log.Array("services", log.ArrayMarshalerFunc(func(encoder log.ArrayEncoder) error {
+			log.Array("services", zapcore.ArrayMarshalerFunc(func(encoder zapcore.ArrayEncoder) error {
 				services := maps.Keys(postSvcs)
 				slices.Sort(services)
 				for _, svc := range services {
@@ -1738,7 +1776,7 @@ func (app *App) startAPIServices(ctx context.Context) error {
 		}
 		logger.With().Info("authenticated grpc service started",
 			log.String("address", app.Config.API.TLSListener),
-			log.Array("services", log.ArrayMarshalerFunc(func(encoder log.ArrayEncoder) error {
+			log.Array("services", zapcore.ArrayMarshalerFunc(func(encoder zapcore.ArrayEncoder) error {
 				services := maps.Keys(authenticatedSvcs)
 				slices.Sort(services)
 				for _, svc := range services {
@@ -1765,7 +1803,7 @@ func (app *App) startAPIServices(ctx context.Context) error {
 		}
 		logger.With().Info("json listener started",
 			log.String("address", app.Config.API.JSONListener),
-			log.Array("services", log.ArrayMarshalerFunc(func(encoder log.ArrayEncoder) error {
+			log.Array("services", zapcore.ArrayMarshalerFunc(func(encoder zapcore.ArrayEncoder) error {
 				services := maps.Keys(publicSvcs)
 				slices.Sort(services)
 				for _, svc := range services {
@@ -1825,6 +1863,14 @@ func (app *App) stopServices(ctx context.Context) {
 
 	if app.hare3 != nil {
 		app.hare3.Stop()
+	}
+
+	if app.hare4 != nil {
+		app.hare4.Stop()
+	}
+
+	if app.hareResultsChan != nil {
+		close(app.hareResultsChan)
 	}
 
 	if app.blockGen != nil {
@@ -1888,7 +1934,7 @@ func (app *App) stopServices(ctx context.Context) {
 	// SetGrpcLogger unfortunately is global
 	// this ensures that a test-logger isn't used after the app shuts down
 	// by e.g. a grpc connection to the node that is still open - like in TestSpacemeshApp_NodeService
-	grpczap.SetGrpcLoggerV2(grpclog, log.NewNop().Zap())
+	grpczap.SetGrpcLoggerV2(grpcLog, log.NewNop().Zap())
 }
 
 func (app *App) setupDBs(ctx context.Context, lg log.Log) error {
@@ -1896,19 +1942,21 @@ func (app *App) setupDBs(ctx context.Context, lg log.Log) error {
 	if err := os.MkdirAll(dbPath, os.ModePerm); err != nil {
 		return fmt.Errorf("failed to create %s: %w", dbPath, err)
 	}
-	dbLog := app.addLogger(StateDbLogger, lg)
-	m21 := migrations.New0021Migration(dbLog.Zap(), 1_000_000)
-	migrations, err := sql.StateMigrations()
+	dbLog := app.addLogger(StateDbLogger, lg).Zap()
+	schema, err := statemigrations.SchemaWithInCodeMigrations()
 	if err != nil {
-		return fmt.Errorf("failed to load migrations: %w", err)
+		return fmt.Errorf("error loading db schema: %w", err)
+	}
+	if len(app.Config.DatabaseSkipMigrations) > 0 {
+		schema.SkipMigrations(app.Config.DatabaseSkipMigrations...)
 	}
 	dbopts := []sql.Opt{
-		sql.WithLogger(dbLog.Zap()),
-		sql.WithMigrations(migrations),
-		sql.WithMigration(m21),
+		sql.WithLogger(dbLog),
+		sql.WithDatabaseSchema(schema),
 		sql.WithConnections(app.Config.DatabaseConnections),
 		sql.WithLatencyMetering(app.Config.DatabaseLatencyMetering),
 		sql.WithVacuumState(app.Config.DatabaseVacuumState),
+		sql.WithAllowSchemaDrift(app.Config.DatabaseSchemaAllowDrift),
 		sql.WithQueryCache(app.Config.DatabaseQueryCache),
 		sql.WithQueryCacheSizes(map[sql.QueryCacheKind]int{
 			atxs.CacheKindEpochATXs:           app.Config.DatabaseQueryCacheSizes.EpochATXs,
@@ -1916,12 +1964,9 @@ func (app *App) setupDBs(ctx context.Context, lg log.Log) error {
 			activesets.CacheKindActiveSetBlob: app.Config.DatabaseQueryCacheSizes.ActiveSetBlob,
 		}),
 	}
-	if len(app.Config.DatabaseSkipMigrations) > 0 {
-		dbopts = append(dbopts, sql.WithSkipMigrations(app.Config.DatabaseSkipMigrations...))
-	}
-	sqlDB, err := sql.Open("file:"+filepath.Join(dbPath, dbFile), dbopts...)
+	sqlDB, err := statesql.Open("file:"+filepath.Join(dbPath, dbFile), dbopts...)
 	if err != nil {
-		return fmt.Errorf("open sqlite db %w", err)
+		return fmt.Errorf("open sqlite db: %w", err)
 	}
 	app.db = sqlDB
 	if app.Config.CollectMetrics && app.Config.DatabaseSizeMeteringInterval != 0 {
@@ -1932,46 +1977,42 @@ func (app *App) setupDBs(ctx context.Context, lg log.Log) error {
 			app.Config.DatabaseSizeMeteringInterval,
 		)
 	}
-	app.log.Info("starting cache warmup")
-	applied, err := layers.GetLastApplied(app.db)
-	if err != nil {
-		return err
+	{
+		warmupLog := app.log.Zap().Named("warmup")
+		app.log.Info("starting cache warmup")
+		applied, err := layers.GetLastApplied(app.db)
+		if err != nil {
+			return err
+		}
+		start := time.Now()
+		data, err := atxsdata.Warm(
+			app.db,
+			app.Config.Tortoise.WindowSizeEpochs(applied),
+			warmupLog,
+		)
+		if err != nil {
+			return err
+		}
+		app.atxsdata = data
+		app.log.With().Info("cache warmup", log.Duration("duration", time.Since(start)))
 	}
-	start := time.Now()
-	data, err := atxsdata.Warm(
-		app.db,
-		app.Config.Tortoise.WindowSizeEpochs(applied),
-	)
-	if err != nil {
-		return err
-	}
-	app.atxsdata = data
-	app.log.With().Info("cache warmup", log.Duration("duration", time.Since(start)))
 	app.cachedDB = datastore.NewCachedDB(sqlDB, app.addLogger(CachedDBLogger, lg).Zap(),
 		datastore.WithConfig(app.Config.Cache),
-		datastore.WithConsensusCache(data),
+		datastore.WithConsensusCache(app.atxsdata),
 	)
 
-	if app.Config.ScanMalfeasantATXs {
-		app.log.With().Info("checking DB for malicious ATXs")
-		start = time.Now()
-		if err := activation.CheckPrevATXs(ctx, app.log.Zap(), app.db); err != nil {
-			return fmt.Errorf("malicious ATX check: %w", err)
-		}
-		app.log.With().Info("malicious ATX check completed", log.Duration("duration", time.Since(start)))
-	}
-
-	migrations, err = sql.LocalMigrations()
+	lSchema, err := localmigrations.SchemaWithInCodeMigrations()
 	if err != nil {
-		return fmt.Errorf("load local migrations: %w", err)
+		return fmt.Errorf("error loading db schema: %w", err)
 	}
 	localDB, err := localsql.Open("file:"+filepath.Join(dbPath, localDbFile),
-		sql.WithLogger(dbLog.Zap()),
-		sql.WithMigrations(migrations),
+		sql.WithLogger(dbLog),
+		sql.WithDatabaseSchema(lSchema),
 		sql.WithConnections(app.Config.DatabaseConnections),
+		sql.WithAllowSchemaDrift(app.Config.DatabaseSchemaAllowDrift),
 	)
 	if err != nil {
-		return fmt.Errorf("open sqlite db %w", err)
+		return fmt.Errorf("open sqlite db: %w", err)
 	}
 	app.localDB = localDB
 	return nil
@@ -2049,6 +2090,14 @@ func (app *App) startSynchronous(ctx context.Context) (err error) {
 			}
 			return nil
 		})
+		if app.Config.PprofMutexProfile {
+			// this will set the mutex profiling to sample a third of all lock events
+			runtime.SetMutexProfileFraction(3)
+		}
+		if app.Config.PprofBlockProfile {
+			// record block sample for every block event that takes more than 10 milliseconds
+			runtime.SetBlockProfileRate(int(10 * time.Millisecond))
+		}
 	}
 
 	if app.Config.ProfilerURL != "" {
@@ -2240,4 +2289,26 @@ func (w tortoiseWeakCoin) Set(lid types.LayerID, value bool) error {
 
 func onMainNet(conf *config.Config) bool {
 	return conf.Genesis.GenesisTime == config.MainnetConfig().Genesis.GenesisTime
+}
+
+// proposalConsumerHare is used for the hare3->hare4 migration
+// to satisfy the proposals handler dependency on hare.
+type proposalConsumerHare struct {
+	hare3          *hare3.Hare
+	h3DisableLayer types.LayerID
+	hare4          *hare4.Hare
+}
+
+func (p *proposalConsumerHare) IsKnown(layer types.LayerID, proposal types.ProposalID) bool {
+	if layer < p.h3DisableLayer {
+		return p.hare3.IsKnown(layer, proposal)
+	}
+	return p.hare4.IsKnown(layer, proposal)
+}
+
+func (p *proposalConsumerHare) OnProposal(proposal *types.Proposal) error {
+	if proposal.Layer < p.h3DisableLayer {
+		return p.hare3.OnProposal(proposal)
+	}
+	return p.hare4.OnProposal(proposal)
 }

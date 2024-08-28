@@ -55,12 +55,12 @@ type ConservativeState struct {
 
 	logger *zap.Logger
 	cfg    CSConfig
-	db     *sql.Database
+	db     sql.StateDatabase
 	cache  *Cache
 }
 
 // NewConservativeState returns a ConservativeState.
-func NewConservativeState(state vmState, db *sql.Database, opts ...ConservativeStateOpt) *ConservativeState {
+func NewConservativeState(state vmState, db sql.StateDatabase, opts ...ConservativeStateOpt) *ConservativeState {
 	cs := &ConservativeState{
 		vmState: state,
 		cfg:     defaultCSConfig(),
@@ -123,8 +123,18 @@ func (cs *ConservativeState) AddToCache(ctx context.Context, tx *types.Transacti
 	if err := cs.cache.Add(ctx, cs.db, tx, received, false); err != nil {
 		return err
 	}
-	events.ReportNewTx(0, tx)
-	events.ReportAccountUpdate(tx.Principal)
+	if err := events.ReportNewTx(0, tx); err != nil {
+		cs.logger.Error("Failed to emit transaction",
+			zap.Stringer("tx_id", tx.ID),
+			zap.Error(err),
+		)
+	}
+	if err := events.ReportAccountUpdate(tx.Principal); err != nil {
+		cs.logger.Error("Failed to emit account update",
+			zap.String("account", tx.Principal.String()),
+			zap.Error(err),
+		)
+	}
 	return nil
 }
 

@@ -6,9 +6,61 @@ See [RELEASE](./RELEASE.md) for workflow instructions.
 
 ### Upgrade information
 
+The command line flag `--scan-malfeasant-atxs` has been removed. All malfeasant ATXs before 1.6.0 have been marked as
+such and the node will continue to scan new ATXs for their validity.
+
 ### Highlights
 
 ### Features
+
+### Improvements
+
+* [#6136](https://github.com/spacemeshos/go-spacemesh/pull/6136) Fixed an issue where the node retried registering
+  for the PoET round only for 15-20 minutes instead of continuing until the start of the round.
+
+## Release v1.6.8
+
+### Improvements
+
+* [#6269](https://github.com/spacemeshos/go-spacemesh/pull/6269) Use sub query instead of left join to speed up
+  transaction list query.
+
+* [#6278](https://github.com/spacemeshos/go-spacemesh/pull/6278) Reduce logging levels of some messages to reduce noise.
+
+* [#6279](https://github.com/spacemeshos/go-spacemesh/pull/6279) Speed up initialization of tortoise by reducing the
+  number of queries to the DB.
+
+* [#6268](https://github.com/spacemeshos/go-spacemesh/pull/6268) Fix incorrect timing collection for proposal builder.
+
+## Release v1.6.7
+
+### Improvements
+
+* [#6197](https://github.com/spacemeshos/go-spacemesh/pull/6197) Fix falling back to poet PoW if recertification
+  failed after getting a 401 on registering
+
+* [#6241](https://github.com/spacemeshos/go-spacemesh/pull/6241) Improve speed of ATX cache warmup.
+
+### Features
+
+* [#6213](https://github.com/spacemeshos/go-spacemesh/pull/6213) Adds `labels_per_unit` to the v2alpha1 Network Info API.
+
+## Release v1.6.6-hotfix1
+
+### Improvements
+
+* [#6248](https://github.com/spacemeshos/go-spacemesh/pull/6248) Fixed node not being able to handle more than 6.55M
+  ATXs per epoch.
+
+## Release v1.6.6
+
+### Improvements
+
+* [#6198](https://github.com/spacemeshos/go-spacemesh/pull/6198) Configure default TTL for caching poet's /v1/info
+
+* [#6199](https://github.com/spacemeshos/go-spacemesh/pull/6199) Cache poet's /v1/pow_params
+
+## Release v1.6.5
 
 ### Improvements
 
@@ -16,6 +68,8 @@ See [RELEASE](./RELEASE.md) for workflow instructions.
 
 * [#6187](https://github.com/spacemeshos/go-spacemesh/pull/6187) The merge tool now ignores files that are not `.key`
   files in the `identities` directory when merging two nodes.
+
+* [#6128](https://github.com/spacemeshos/go-spacemesh/pull/6128) Reduce logs spam
 
 ## Release v1.6.4
 
@@ -136,6 +190,9 @@ operating your own PoET and want to use certificate authentication please refer 
 * [#5927](https://github.com/spacemeshos/go-spacemesh/pull/5927) Fixed vulnerability in the way a node handles incoming
   ATXs. This vulnerability allows an attacker to claim rewards for a full tick amount although they should not be
   eligible for them.
+
+* [#6003](https://github.com/spacemeshos/go-spacemesh/pull/6003) Improve database schema handling.
+  This includes schema drift detection which may happen after running unreleased versions.
 
 * [#6031](https://github.com/spacemeshos/go-spacemesh/pull/6031) Fixed an edge case where the storage units might have
   changed after the initial PoST was generated but before the first ATX has been emitted, invalidating the initial PoST.
@@ -685,6 +742,7 @@ and permanent ineligibility for rewards.
 
 * [#5494](https://github.com/spacemeshos/go-spacemesh/pull/5494)
   Make routing discovery more configurable and less spammy by default.
+
 * [#5511](https://github.com/spacemeshos/go-spacemesh/pull/5511)
   Fix dialing peers on their private IPs, which was causing "portscan" complaints.
 
@@ -694,7 +752,7 @@ and permanent ineligibility for rewards.
 
 * [#5470](https://github.com/spacemeshos/go-spacemesh/pull/5470)
   Fixed a bug in event reporting where the node reports a disconnection from the PoST service as a "PoST failed" event.
-  Disconnections cannot be avoided completely and do not interrupt the PoST proofing process. As long as the PoST
+  Disconnections cannot be avoided completely and do not interrupt the PoST proving process. As long as the PoST
   service reconnects within a reasonable time, the node will continue to operate normally without reporting any errors
   via the event API.
 

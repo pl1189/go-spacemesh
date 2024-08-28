@@ -13,11 +13,11 @@ import (
 	"time"
 
 	"github.com/spf13/afero"
+	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/spacemeshos/go-spacemesh/bootstrap"
 	"github.com/spacemeshos/go-spacemesh/common/types"
-	"github.com/spacemeshos/go-spacemesh/log"
 )
 
 const fileRegex = "/epoch-(?P<Epoch>[0-9]+)-update-(?P<Suffix>[a-z]+)"
@@ -45,7 +45,7 @@ func (np *NetworkParam) updateActiveSetTime(targetEpoch types.EpochID) time.Time
 type Server struct {
 	*http.Server
 	eg              errgroup.Group
-	logger          log.Log
+	logger          *zap.Logger
 	fs              afero.Fs
 	gen             *Generator
 	genFallback     bool
@@ -55,7 +55,7 @@ type Server struct {
 
 type SrvOpt func(*Server)
 
-func WithSrvLogger(logger log.Log) SrvOpt {
+func WithSrvLogger(logger *zap.Logger) SrvOpt {
 	return func(s *Server) {
 		s.logger = logger
 	}
@@ -76,7 +76,7 @@ func WithBootstrapEpochs(epochs []types.EpochID) SrvOpt {
 func NewServer(gen *Generator, fallback bool, port int, opts ...SrvOpt) *Server {
 	s := &Server{
 		Server:          &http.Server{Addr: fmt.Sprintf(":%d", port)},
-		logger:          log.NewNop(),
+		logger:          zap.NewNop(),
 		fs:              afero.NewOsFs(),
 		gen:             gen,
 		genFallback:     fallback,
@@ -102,7 +102,7 @@ func (s *Server) Start(ctx context.Context, errCh chan error, params *NetworkPar
 		http.HandleFunc("/", s.handle)
 		http.HandleFunc("/checkpoint", s.handleCheckpoint)
 		http.HandleFunc("/updateCheckpoint", s.handleUpdate)
-		s.logger.With().Info("server starts serving", log.String("addr", ln.Addr().String()))
+		s.logger.Info("server starts serving", zap.Stringer("addr", ln.Addr()))
 		if err = s.Serve(ln); err != nil {
 			errCh <- err
 			return err
@@ -132,19 +132,70 @@ func (s *Server) Start(ctx context.Context, errCh chan error, params *NetworkPar
 		}
 
 		// start generating fallback data
-		s.eg.Go(
-			func() error {
-				s.genDataLoop(ctx, errCh, last, params.updateActiveSetTime, s.GenFallbackActiveSet)
-				return nil
-			})
-		s.eg.Go(
-			func() error {
-				s.genDataLoop(ctx, errCh, last+1, params.updateBeaconTime, s.GenFallbackBeacon)
-				return nil
-			})
+		s.eg.Go(func() error {
+			for epoch := last; ; epoch++ {
+				wait := time.Until(params.updateActiveSetTime(epoch))
+				select {
+				case <-time.After(wait):
+					if err := s.genWithRetry(ctx, epoch, 10); err != nil {
+						errCh <- err
+						return nil
+					}
+				case <-ctx.Done():
+					return nil
+				}
+			}
+		})
+		s.eg.Go(func() error {
+			for epoch := last + 1; ; epoch++ {
+				wait := time.Until(params.updateBeaconTime(epoch))
+				select {
+				case <-time.After(wait):
+					if err := s.GenFallbackBeacon(epoch); err != nil {
+						errCh <- err
+						return err
+					}
+				case <-ctx.Done():
+					return nil
+				}
+			}
+		})
 
 		return nil
 	})
+}
+
+func (s *Server) genWithRetry(ctx context.Context, epoch types.EpochID, maxRetries int) error {
+	err := s.GenFallbackActiveSet(ctx, epoch)
+	if err == nil {
+		return nil
+	}
+	s.logger.Debug("generate fallback active set retry", zap.Error(err))
+
+	retries := 0
+	backoff := 10 * time.Second
+	timer := time.NewTimer(backoff)
+
+	for {
+		select {
+		case <-timer.C:
+			if err := s.GenFallbackActiveSet(ctx, epoch); err != nil {
+				s.logger.Debug("generate fallback active set retry", zap.Error(err))
+				retries++
+				if retries >= maxRetries {
+					return err
+				}
+				timer.Reset(backoff)
+				continue
+			}
+			return nil
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		}
+	}
 }
 
 // in systests, we want to be sure the nodes use the fallback data unconditionally.
@@ -165,7 +216,7 @@ func (s *Server) GenBootstrap(ctx context.Context, epoch types.EpochID) error {
 	return err
 }
 
-func (s *Server) GenFallbackBeacon(_ context.Context, epoch types.EpochID) error {
+func (s *Server) GenFallbackBeacon(epoch types.EpochID) error {
 	suffix := bootstrap.SuffixBeacon
 	_, err := s.gen.GenUpdate(epoch, epochBeacon(epoch), nil, suffix)
 	return err
@@ -193,43 +244,22 @@ func getPartialActiveSet(ctx context.Context, smEndpoint string, targetEpoch typ
 	return actives[:cutoff], nil
 }
 
-func (s *Server) genDataLoop(
-	ctx context.Context,
-	errCh chan error,
-	start types.EpochID,
-	timeFunc func(types.EpochID) time.Time,
-	genFunc func(context.Context, types.EpochID) error,
-) {
-	for epoch := start; ; epoch++ {
-		wait := time.Until(timeFunc(epoch))
-		select {
-		case <-time.After(wait):
-			if err := genFunc(ctx, epoch); err != nil {
-				errCh <- err
-				return
-			}
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
 func (s *Server) Stop(ctx context.Context) {
-	s.logger.With().Info("shutting down server")
-	_ = s.Shutdown(ctx)
-	_ = s.eg.Wait()
+	s.logger.Info("shutting down server")
+	s.Shutdown(ctx)
+	s.eg.Wait()
 }
 
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	matches := s.regex.FindStringSubmatch(r.URL.String())
 	if len(matches) != 3 {
-		s.logger.With().Error("unrecognized url", log.String("url", r.URL.String()))
+		s.logger.Error("unrecognized url", zap.Stringer("url", r.URL))
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 	e, err := strconv.Atoi(matches[1])
 	if err != nil {
-		s.logger.With().Error("unrecognized url", log.String("url", r.URL.String()), log.Err(err))
+		s.logger.Error("unrecognized url", zap.Stringer("url", r.URL), zap.Error(err))
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -280,8 +310,5 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "save checkpoint err: %v", err)
 		return
 	}
-	s.logger.With().Info("saved checkpoint data",
-		log.String("data", data),
-		log.String("filename", filename),
-	)
+	s.logger.Info("saved checkpoint data", zap.String("data", data), zap.String("filename", filename))
 }

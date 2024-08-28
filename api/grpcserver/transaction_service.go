@@ -28,7 +28,7 @@ import (
 
 // TransactionService exposes transaction data, and a submit tx endpoint.
 type TransactionService struct {
-	db        *sql.Database
+	db        sql.StateDatabase
 	publisher pubsub.Publisher // P2P Swarm
 	mesh      meshAPI          // Mesh
 	conState  conservativeState
@@ -52,7 +52,7 @@ func (s *TransactionService) String() string {
 
 // NewTransactionService creates a new grpc service using config data.
 func NewTransactionService(
-	db *sql.Database,
+	db sql.StateDatabase,
 	publisher pubsub.Publisher,
 	msh meshAPI,
 	conState conservativeState,
@@ -202,11 +202,19 @@ func (s *TransactionService) TransactionsStateStream(
 		txBufFull, layerBufFull <-chan struct{}
 	)
 
-	if txsSubscription := events.SubscribeTxs(); txsSubscription != nil {
+	txsSubscription, err := events.SubscribeTxs()
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to subscribe to tx events: %v", err)
+	}
+	if txsSubscription != nil {
 		txCh, txBufFull = consumeEvents[events.Transaction](stream.Context(), txsSubscription)
 	}
 
-	if layersSubscription := events.SubscribeLayers(); layersSubscription != nil {
+	layersSubscription, err := events.SubscribeLayers()
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to subscribe to layer events: %v", err)
+	}
+	if layersSubscription != nil {
 		layerCh, layerBufFull = consumeEvents[events.LayerUpdate](stream.Context(), layersSubscription)
 	}
 
@@ -265,7 +273,7 @@ func (s *TransactionService) TransactionsStateStream(
 				ctxzap.Error(
 					stream.Context(),
 					"error reading layer data for updated layer",
-					layer.LayerID.Field().Zap(),
+					zap.Uint32("lid", layer.LayerID.Uint32()),
 					zap.Error(err),
 				)
 				return status.Error(codes.Internal, "error reading layer data")
@@ -313,8 +321,8 @@ func (s *TransactionService) TransactionsStateStream(
 								ctxzap.Error(
 									stream.Context(),
 									"could not find transaction from layer",
-									txid.Field().Zap(),
-									layer.Field().Zap(),
+									zap.Stringer("tx_id", txid),
+									zap.Inline(layer),
 									zap.Error(err),
 								)
 								return status.Error(codes.Internal, "error retrieving tx data")

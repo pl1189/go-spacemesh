@@ -25,9 +25,9 @@ import (
 	"github.com/spacemeshos/go-spacemesh/p2p/pubsub"
 	"github.com/spacemeshos/go-spacemesh/p2p/pubsub/mocks"
 	"github.com/spacemeshos/go-spacemesh/signing"
-	"github.com/spacemeshos/go-spacemesh/sql"
 	"github.com/spacemeshos/go-spacemesh/sql/accounts"
 	"github.com/spacemeshos/go-spacemesh/sql/localsql"
+	"github.com/spacemeshos/go-spacemesh/sql/statesql"
 	smocks "github.com/spacemeshos/go-spacemesh/system/mocks"
 	"github.com/spacemeshos/go-spacemesh/timesync"
 )
@@ -46,7 +46,7 @@ func TestCheckpoint_PublishingSoloATXs(t *testing.T) {
 	require.NoError(t, err)
 
 	cfg := testPostConfig()
-	db := sql.InMemory()
+	db := statesql.InMemory()
 	cdb := datastore.NewCachedDB(db, logger)
 
 	opts := testPostSetupOpts(t)
@@ -71,7 +71,7 @@ func TestCheckpoint_PublishingSoloATXs(t *testing.T) {
 		CycleGap:    3 * epoch / 4,
 		GracePeriod: epoch / 4,
 	}
-	client := ae2e.NewTestPoetClient(1)
+	client := ae2e.NewTestPoetClient(1, poetCfg)
 	poetService := activation.NewPoetServiceWithClient(poetDb, client, poetCfg, logger)
 
 	// ensure that genesis aligns with layer timings
@@ -181,14 +181,14 @@ func TestCheckpoint_PublishingSoloATXs(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, data)
 
-	newDB, err := sql.Open("file:" + recoveryCfg.DbPath())
+	newDB, err := statesql.Open("file:" + recoveryCfg.DbPath())
 	require.NoError(t, err)
 	defer newDB.Close()
 
 	// 3. Spawn new ATX handler and builder using the new DB
 	poetDb = activation.NewPoetDb(newDB, logger.Named("poetDb"))
 	cdb = datastore.NewCachedDB(newDB, logger)
-	atxdata, err = atxsdata.Warm(newDB, 1)
+	atxdata, err = atxsdata.Warm(newDB, 1, logger)
 	poetService = activation.NewPoetServiceWithClient(poetDb, client, poetCfg, logger)
 	validator = activation.NewValidator(newDB, poetDb, cfg, opts.Scrypt, verifier)
 	require.NoError(t, err)

@@ -22,9 +22,9 @@ import (
 	"github.com/spacemeshos/go-spacemesh/bootstrap"
 	"github.com/spacemeshos/go-spacemesh/common/types"
 	"github.com/spacemeshos/go-spacemesh/datastore"
-	"github.com/spacemeshos/go-spacemesh/log/logtest"
 	"github.com/spacemeshos/go-spacemesh/sql"
 	"github.com/spacemeshos/go-spacemesh/sql/atxs"
+	"github.com/spacemeshos/go-spacemesh/sql/statesql"
 )
 
 func TestMain(m *testing.M) {
@@ -103,7 +103,7 @@ func verifyUpdate(tb testing.TB, data []byte, epoch types.EpochID, expBeacon str
 func TestGenerator_Generate(t *testing.T) {
 	t.Parallel()
 	targetEpoch := types.EpochID(3)
-	db := sql.InMemory()
+	db := statesql.InMemory()
 	createAtxs(t, db, targetEpoch-1, types.RandomActiveSet(activeSetSize))
 	cfg, cleanup := launchServer(t, datastore.NewCachedDB(db, zaptest.NewLogger(t)))
 	t.Cleanup(cleanup)
@@ -143,7 +143,7 @@ func TestGenerator_Generate(t *testing.T) {
 			g := NewGenerator(
 				ts.URL,
 				cfg.PublicListener,
-				WithLogger(logtest.New(t)),
+				WithLogger(zaptest.NewLogger(t)),
 				WithFilesystem(fs),
 				WithHttpClient(ts.Client()),
 			)
@@ -169,10 +169,10 @@ func TestGenerator_Generate(t *testing.T) {
 func TestGenerator_CheckAPI(t *testing.T) {
 	t.Parallel()
 	targetEpoch := types.EpochID(3)
-	db := sql.InMemory()
-	lg := logtest.New(t)
+	db := statesql.InMemory()
+	lg := zaptest.NewLogger(t)
 	createAtxs(t, db, targetEpoch-1, types.RandomActiveSet(activeSetSize))
-	cfg, cleanup := launchServer(t, datastore.NewCachedDB(db, lg.Zap()))
+	cfg, cleanup := launchServer(t, datastore.NewCachedDB(db, lg))
 	t.Cleanup(cleanup)
 
 	fs := afero.NewMemMapFs()

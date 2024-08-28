@@ -28,7 +28,6 @@ import (
 	"github.com/spacemeshos/go-spacemesh/signing"
 	"github.com/spacemeshos/go-spacemesh/sql"
 	"github.com/spacemeshos/go-spacemesh/sql/atxs"
-	"github.com/spacemeshos/go-spacemesh/sql/localsql"
 	"github.com/spacemeshos/go-spacemesh/sql/localsql/nipost"
 )
 
@@ -39,13 +38,21 @@ var (
 
 // PoetConfig is the configuration to interact with the poet server.
 type PoetConfig struct {
-	PhaseShift                     time.Duration `mapstructure:"phase-shift"`
-	CycleGap                       time.Duration `mapstructure:"cycle-gap"`
-	GracePeriod                    time.Duration `mapstructure:"grace-period"`
-	RequestTimeout                 time.Duration `mapstructure:"poet-request-timeout"`
-	RequestRetryDelay              time.Duration `mapstructure:"retry-delay"`
+	// Offset from the epoch start when the poet round starts
+	PhaseShift time.Duration `mapstructure:"phase-shift"`
+	// CycleGap gives the duration between the end of a PoET round and the start of the next
+	CycleGap time.Duration `mapstructure:"cycle-gap"`
+	// GracePeriod defines the time before the start of the next PoET round until the node
+	// waits before building its NiPoST challenge. Shorter durations allow the node to
+	// possibly pick a better positioning ATX, but come with the risk that the node might
+	// not be able to validate that ATX and has to fall back to using its own previous ATX.
+	GracePeriod       time.Duration `mapstructure:"grace-period"`
+	RequestTimeout    time.Duration `mapstructure:"poet-request-timeout"`
+	RequestRetryDelay time.Duration `mapstructure:"retry-delay"`
+	// Period to find positioning ATX. Must be less, than GracePeriod
 	PositioningATXSelectionTimeout time.Duration `mapstructure:"positioning-atx-selection-timeout"`
 	CertifierInfoCacheTTL          time.Duration `mapstructure:"certifier-info-cache-ttl"`
+	PowParamsCacheTTL              time.Duration `mapstructure:"pow-params-cache-ttl"`
 	MaxRequestRetries              int           `mapstructure:"retry-max"`
 }
 
@@ -54,6 +61,7 @@ func DefaultPoetConfig() PoetConfig {
 		RequestRetryDelay:     400 * time.Millisecond,
 		MaxRequestRetries:     10,
 		CertifierInfoCacheTTL: 5 * time.Minute,
+		PowParamsCacheTTL:     5 * time.Minute,
 	}
 }
 
@@ -76,7 +84,7 @@ type Builder struct {
 	conf              Config
 	db                sql.Executor
 	atxsdata          *atxsdata.Data
-	localDB           *localsql.Database
+	localDB           sql.LocalDatabase
 	publisher         pubsub.Publisher
 	nipostBuilder     nipostBuilder
 	validator         nipostValidator
@@ -172,7 +180,7 @@ func NewBuilder(
 	conf Config,
 	db sql.Executor,
 	atxsdata *atxsdata.Data,
-	localDB *localsql.Database,
+	localDB sql.LocalDatabase,
 	publisher pubsub.Publisher,
 	nipostBuilder nipostBuilder,
 	layerClock layerClock,
@@ -441,6 +449,7 @@ func (b *Builder) run(ctx context.Context, sig *signing.EdSigner) {
 
 		b.logger.Warn("failed to publish atx", zap.Error(err))
 
+		poetErr := &PoetSvcUnstableError{}
 		switch {
 		case errors.Is(err, ErrATXChallengeExpired):
 			b.logger.Debug("retrying with new challenge after waiting for a layer")
@@ -457,8 +466,11 @@ func (b *Builder) run(ctx context.Context, sig *signing.EdSigner) {
 				return
 			case <-b.layerClock.AwaitLayer(currentLayer.Add(1)):
 			}
-		case errors.Is(err, ErrPoetServiceUnstable):
-			b.logger.Warn("retrying after poet retry interval", zap.Duration("interval", b.poetRetryInterval))
+		case errors.As(err, &poetErr):
+			b.logger.Warn("retrying after poet retry interval",
+				zap.Duration("interval", b.poetRetryInterval),
+				zap.Error(poetErr.source),
+			)
 			select {
 			case <-ctx.Done():
 				return
@@ -553,7 +565,6 @@ func (b *Builder) BuildNIPostChallenge(ctx context.Context, nodeID types.NodeID)
 		case <-time.After(time.Until(wait)):
 		}
 	}
-
 	if b.poetCfg.PositioningATXSelectionTimeout > 0 {
 		var cancel context.CancelFunc
 

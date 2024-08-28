@@ -16,11 +16,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
+	"go.uber.org/zap/zaptest"
 	"golang.org/x/exp/maps"
 
 	"github.com/spacemeshos/go-spacemesh/atxsdata"
 	"github.com/spacemeshos/go-spacemesh/common/types"
-	"github.com/spacemeshos/go-spacemesh/log/logtest"
 	"github.com/spacemeshos/go-spacemesh/signing"
 	"github.com/spacemeshos/go-spacemesh/sql"
 	"github.com/spacemeshos/go-spacemesh/sql/activesets"
@@ -28,6 +28,7 @@ import (
 	"github.com/spacemeshos/go-spacemesh/sql/ballots"
 	"github.com/spacemeshos/go-spacemesh/sql/blocks"
 	"github.com/spacemeshos/go-spacemesh/sql/layers"
+	"github.com/spacemeshos/go-spacemesh/sql/statesql"
 	"github.com/spacemeshos/go-spacemesh/system/mocks"
 )
 
@@ -46,14 +47,14 @@ func TestMain(m *testing.M) {
 type testOracle struct {
 	*Oracle
 	tb        testing.TB
-	db        *sql.Database
+	db        sql.StateDatabase
 	atxsdata  *atxsdata.Data
 	mBeacon   *mocks.MockBeaconGetter
 	mVerifier *MockvrfVerifier
 }
 
 func defaultOracle(tb testing.TB) *testOracle {
-	db := sql.InMemory()
+	db := statesql.InMemory()
 	atxsdata := atxsdata.New()
 
 	ctrl := gomock.NewController(tb)
@@ -68,7 +69,7 @@ func defaultOracle(tb testing.TB) *testOracle {
 			mVerifier,
 			defLayersPerEpoch,
 			WithConfig(Config{ConfidenceParam: confidenceParam}),
-			WithLogger(logtest.New(tb)),
+			WithLogger(zaptest.NewLogger(tb)),
 		),
 		tb:        tb,
 		mBeacon:   mBeacon,

@@ -17,6 +17,7 @@ import (
 	"github.com/spacemeshos/go-spacemesh/atxsdata"
 	"github.com/spacemeshos/go-spacemesh/codec"
 	"github.com/spacemeshos/go-spacemesh/common/types"
+	"github.com/spacemeshos/go-spacemesh/hare4"
 	"github.com/spacemeshos/go-spacemesh/layerpatrol"
 	"github.com/spacemeshos/go-spacemesh/log"
 	"github.com/spacemeshos/go-spacemesh/metrics"
@@ -128,9 +129,9 @@ type WeakCoinOutput struct {
 
 type Opt func(*Hare)
 
-func WithWallclock(clock clockwork.Clock) Opt {
+func WithWallClock(clock clockwork.Clock) Opt {
 	return func(hr *Hare) {
-		hr.wallclock = clock
+		hr.wallClock = clock
 	}
 }
 
@@ -154,16 +155,24 @@ func WithTracer(tracer Tracer) Opt {
 	}
 }
 
-type nodeclock interface {
+// WithResultsChan overrides the default result channel with a different one.
+// This is only needed for the migration period between hare3 and hare4.
+func WithResultsChan(c chan hare4.ConsensusOutput) Opt {
+	return func(hr *Hare) {
+		hr.results = c
+	}
+}
+
+type nodeClock interface {
 	AwaitLayer(types.LayerID) <-chan struct{}
 	CurrentLayer() types.LayerID
 	LayerToTime(types.LayerID) time.Time
 }
 
 func New(
-	nodeclock nodeclock,
-	pubsub pubsub.PublishSubsciber,
-	db *sql.Database,
+	nodeClock nodeClock,
+	pubsub pubsub.PublishSubscriber,
+	db sql.StateDatabase,
 	atxsdata *atxsdata.Data,
 	proposals *store.Store,
 	verifier *signing.EdVerifier,
@@ -176,16 +185,16 @@ func New(
 	hr := &Hare{
 		ctx:      ctx,
 		cancel:   cancel,
-		results:  make(chan ConsensusOutput, 32),
-		coins:    make(chan WeakCoinOutput, 32),
+		results:  make(chan hare4.ConsensusOutput, 32),
+		coins:    make(chan hare4.WeakCoinOutput, 32),
 		signers:  map[string]*signing.EdSigner{},
 		sessions: map[types.LayerID]*protocol{},
 
 		config:    DefaultConfig(),
 		log:       zap.NewNop(),
-		wallclock: clockwork.NewRealClock(),
+		wallClock: clockwork.NewRealClock(),
 
-		nodeclock: nodeclock,
+		nodeClock: nodeClock,
 		pubsub:    pubsub,
 		db:        db,
 		atxsdata:  atxsdata,
@@ -211,8 +220,8 @@ type Hare struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	eg       errgroup.Group
-	results  chan ConsensusOutput
-	coins    chan WeakCoinOutput
+	results  chan hare4.ConsensusOutput
+	coins    chan hare4.WeakCoinOutput
 	mu       sync.Mutex
 	signers  map[string]*signing.EdSigner
 	sessions map[types.LayerID]*protocol
@@ -220,12 +229,12 @@ type Hare struct {
 	// options
 	config    Config
 	log       *zap.Logger
-	wallclock clockwork.Clock
+	wallClock clockwork.Clock
 
 	// dependencies
-	nodeclock nodeclock
-	pubsub    pubsub.PublishSubsciber
-	db        *sql.Database
+	nodeClock nodeClock
+	pubsub    pubsub.PublishSubscriber
+	db        sql.StateDatabase
 	atxsdata  *atxsdata.Data
 	proposals *store.Store
 	verifier  *signing.EdVerifier
@@ -242,17 +251,17 @@ func (h *Hare) Register(sig *signing.EdSigner) {
 	h.signers[string(sig.NodeID().Bytes())] = sig
 }
 
-func (h *Hare) Results() <-chan ConsensusOutput {
+func (h *Hare) Results() <-chan hare4.ConsensusOutput {
 	return h.results
 }
 
-func (h *Hare) Coins() <-chan WeakCoinOutput {
+func (h *Hare) Coins() <-chan hare4.WeakCoinOutput {
 	return h.coins
 }
 
 func (h *Hare) Start() {
 	h.pubsub.Register(h.config.ProtocolName, h.Handler, pubsub.WithValidatorInline(true))
-	current := h.nodeclock.CurrentLayer() + 1
+	current := h.nodeClock.CurrentLayer() + 1
 	enabled := max(current, h.config.EnableLayer, types.GetEffectiveGenesis()+1)
 	disabled := types.LayerID(math.MaxUint32)
 	if h.config.DisableLayer > 0 {
@@ -266,7 +275,7 @@ func (h *Hare) Start() {
 	h.eg.Go(func() error {
 		for next := enabled; next < disabled; next++ {
 			select {
-			case <-h.nodeclock.AwaitLayer(next):
+			case <-h.nodeClock.AwaitLayer(next):
 				h.log.Debug("notified", zap.Uint32("lid", next.Uint32()))
 				h.onLayer(next)
 			case <-h.ctx.Done():
@@ -340,7 +349,7 @@ func (h *Hare) Handler(ctx context.Context, peer p2p.Peer, buf []byte) error {
 		droppedMessages.Inc()
 		return errors.New("dropped by graded gossip")
 	}
-	expected := h.nodeclock.LayerToTime(msg.Layer).Add(h.config.roundStart(msg.IterRound))
+	expected := h.nodeClock.LayerToTime(msg.Layer).Add(h.config.roundStart(msg.IterRound))
 	metrics.ReportMessageLatency(h.config.ProtocolName, msg.Round.String(), time.Since(expected))
 	return nil
 }
@@ -417,12 +426,12 @@ func (h *Hare) run(session *session) error {
 	h.tracer.OnActive(session.vrfs)
 	activeLatency.Observe(time.Since(start).Seconds())
 
-	walltime := h.nodeclock.LayerToTime(session.lid).Add(h.config.PreroundDelay)
+	walltime := h.nodeClock.LayerToTime(session.lid).Add(h.config.PreroundDelay)
 	if active {
 		h.log.Debug("active in preround. waiting for preround delay", zap.Uint32("lid", session.lid.Uint32()))
 		// initial set is not needed if node is not active in preround
 		select {
-		case <-h.wallclock.After(walltime.Sub(h.wallclock.Now())):
+		case <-h.wallClock.After(walltime.Sub(h.wallClock.Now())):
 		case <-h.ctx.Done():
 			return h.ctx.Err()
 		}
@@ -450,7 +459,7 @@ func (h *Hare) run(session *session) error {
 		activeLatency.Observe(time.Since(start).Seconds())
 
 		select {
-		case <-h.wallclock.After(walltime.Sub(h.wallclock.Now())):
+		case <-h.wallClock.After(walltime.Sub(h.wallClock.Now())):
 			h.log.Debug("execute round",
 				zap.Uint32("lid", session.lid.Uint32()),
 				zap.Uint8("iter", session.proto.Iter), zap.Stringer("round", session.proto.Round),
@@ -507,7 +516,7 @@ func (h *Hare) onOutput(session *session, ir IterRound, out output) error {
 		select {
 		case <-h.ctx.Done():
 			return h.ctx.Err()
-		case h.coins <- WeakCoinOutput{Layer: session.lid, Coin: *out.coin}:
+		case h.coins <- hare4.WeakCoinOutput{Layer: session.lid, Coin: *out.coin}:
 		}
 		sessionCoin.Inc()
 	}
@@ -515,7 +524,7 @@ func (h *Hare) onOutput(session *session, ir IterRound, out output) error {
 		select {
 		case <-h.ctx.Done():
 			return h.ctx.Err()
-		case h.results <- ConsensusOutput{Layer: session.lid, Proposals: out.result}:
+		case h.results <- hare4.ConsensusOutput{Layer: session.lid, Proposals: out.result}:
 		}
 		sessionResult.Inc()
 	}
@@ -617,7 +626,6 @@ func (h *Hare) OnProposal(p *types.Proposal) error {
 func (h *Hare) Stop() {
 	h.cancel()
 	h.eg.Wait()
-	close(h.results)
 	close(h.coins)
 	h.log.Info("stopped")
 }

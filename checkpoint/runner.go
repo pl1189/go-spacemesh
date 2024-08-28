@@ -28,7 +28,7 @@ const (
 
 func checkpointDB(
 	ctx context.Context,
-	db *sql.Database,
+	db sql.StateDatabase,
 	snapshot types.LayerID,
 	numAtxs int,
 ) (*types.Checkpoint, error) {
@@ -78,10 +78,15 @@ func checkpointDB(
 		if mal, ok := malicious[catx.SmesherID]; ok && mal {
 			continue
 		}
+		var marriageAtx []byte
+		if catx.MarriageATX != nil {
+			marriageAtx = catx.MarriageATX.Bytes()
+		}
 		checkpoint.Data.Atxs = append(checkpoint.Data.Atxs, types.AtxSnapshot{
 			ID:             catx.ID.Bytes(),
 			Epoch:          catx.Epoch.Uint32(),
 			CommitmentAtx:  catx.CommitmentATX.Bytes(),
+			MarriageAtx:    marriageAtx,
 			VrfNonce:       uint64(catx.VRFNonce),
 			NumUnits:       catx.NumUnits,
 			BaseTickHeight: catx.BaseTickHeight,
@@ -166,7 +171,7 @@ func checkpointDB(
 func Generate(
 	ctx context.Context,
 	fs afero.Fs,
-	db *sql.Database,
+	db sql.StateDatabase,
 	dataDir string,
 	snapshot types.LayerID,
 	numAtxs int,

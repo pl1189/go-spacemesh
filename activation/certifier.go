@@ -21,7 +21,6 @@ import (
 	"github.com/spacemeshos/go-spacemesh/common/types"
 	"github.com/spacemeshos/go-spacemesh/sql"
 	"github.com/spacemeshos/go-spacemesh/sql/atxs"
-	"github.com/spacemeshos/go-spacemesh/sql/localsql"
 	certifierdb "github.com/spacemeshos/go-spacemesh/sql/localsql/certifier"
 	"github.com/spacemeshos/go-spacemesh/sql/localsql/nipost"
 )
@@ -80,14 +79,14 @@ type CertifyResponse struct {
 
 type Certifier struct {
 	logger *zap.Logger
-	db     *localsql.Database
+	db     sql.LocalDatabase
 	client certifierClient
 
 	certifications singleflight.Group
 }
 
 func NewCertifier(
-	db *localsql.Database,
+	db sql.LocalDatabase,
 	logger *zap.Logger,
 	client certifierClient,
 ) *Certifier {
@@ -117,7 +116,15 @@ func (c *Certifier) Certificate(
 		case !errors.Is(err, sql.ErrNotFound):
 			return nil, fmt.Errorf("getting certificate from DB for: %w", err)
 		}
-		return c.Recertify(ctx, id, certifier, pubkey)
+		cert, err = c.client.Certify(ctx, id, certifier, pubkey)
+		if err != nil {
+			return nil, fmt.Errorf("certifying POST at %v: %w", certifier, err)
+		}
+
+		if err := certifierdb.AddCertificate(c.db, id, *cert, pubkey); err != nil {
+			c.logger.Warn("failed to persist poet cert", zap.Error(err))
+		}
+		return cert, nil
 	})
 
 	if err != nil {
@@ -126,28 +133,18 @@ func (c *Certifier) Certificate(
 	return cert.(*certifierdb.PoetCert), nil
 }
 
-func (c *Certifier) Recertify(
-	ctx context.Context,
-	id types.NodeID,
-	certifier *url.URL,
-	pubkey []byte,
-) (*certifierdb.PoetCert, error) {
-	cert, err := c.client.Certify(ctx, id, certifier, pubkey)
-	if err != nil {
-		return nil, fmt.Errorf("certifying POST at %v: %w", certifier, err)
+func (c *Certifier) DeleteCertificate(id types.NodeID, pubkey []byte) error {
+	if err := certifierdb.DeleteCertificate(c.db, id, pubkey); err != nil {
+		return err
 	}
-
-	if err := certifierdb.AddCertificate(c.db, id, *cert, pubkey); err != nil {
-		c.logger.Warn("failed to persist poet cert", zap.Error(err))
-	}
-	return cert, nil
+	return nil
 }
 
 type CertifierClient struct {
 	client  *retryablehttp.Client
 	logger  *zap.Logger
 	db      sql.Executor
-	localDb *localsql.Database
+	localDb sql.LocalDatabase
 }
 
 type certifierClientOpts func(*CertifierClient)
@@ -162,7 +159,7 @@ func WithCertifierClientConfig(cfg CertifierClientConfig) certifierClientOpts {
 
 func NewCertifierClient(
 	db sql.Executor,
-	localDb *localsql.Database,
+	localDb sql.LocalDatabase,
 	logger *zap.Logger,
 	opts ...certifierClientOpts,
 ) *CertifierClient {

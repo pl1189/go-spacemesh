@@ -33,6 +33,7 @@ import (
 	"github.com/spacemeshos/go-spacemesh/sql/localsql"
 	"github.com/spacemeshos/go-spacemesh/sql/localsql/nipost"
 	sqlmocks "github.com/spacemeshos/go-spacemesh/sql/mocks"
+	"github.com/spacemeshos/go-spacemesh/sql/statesql"
 )
 
 // ========== Vars / Consts ==========
@@ -54,7 +55,7 @@ func TestMain(m *testing.M) {
 type testAtxBuilder struct {
 	*Builder
 	db          sql.Executor
-	localDb     *localsql.Database
+	localDb     sql.LocalDatabase
 	goldenATXID types.ATXID
 
 	observedLogs *observer.ObservedLogs
@@ -77,7 +78,7 @@ func newTestBuilder(tb testing.TB, numSigners int, opts ...BuilderOption) *testA
 
 	ctrl := gomock.NewController(tb)
 	tab := &testAtxBuilder{
-		db:          sql.InMemory(),
+		db:          statesql.InMemory(),
 		localDb:     localsql.InMemory(sql.WithConnections(numSigners)),
 		goldenATXID: types.ATXID(types.HexToHash32("77777")),
 
@@ -137,6 +138,7 @@ func publishAtxV1(
 			return codec.Decode(got, &watx)
 		})
 	require.NoError(tb, atxs.Add(tab.db, toAtx(tb, &watx), watx.Blob()))
+	require.NoError(tb, atxs.SetPost(tab.db, watx.ID(), watx.PrevATXID, 0, watx.SmesherID, watx.NumUnits))
 	tab.atxsdata.AddFromAtx(toAtx(tb, &watx), false)
 	return &watx
 }
@@ -1076,7 +1078,7 @@ func TestBuilder_RetryPublishActivationTx(t *testing.T) {
 				tries++
 				t.Logf("try %d: %s", tries, now)
 				if tries < expectedTries {
-					return nil, ErrPoetServiceUnstable
+					return nil, &PoetSvcUnstableError{}
 				}
 				close(builderConfirmation)
 				return newNIPostWithPoet(t, []byte("66666")), nil

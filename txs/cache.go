@@ -295,7 +295,7 @@ func (ac *accountCache) add(logger *zap.Logger, tx *types.Transaction, received 
 
 func (ac *accountCache) addPendingFromNonce(
 	logger *zap.Logger,
-	db *sql.Database,
+	db sql.StateDatabase,
 	nonce uint64,
 	applied types.LayerID,
 ) error {
@@ -382,7 +382,7 @@ func (ac *accountCache) getMempool(logger *zap.Logger) []*NanoTX {
 // because applying a layer changes the conservative balance in the cache.
 func (ac *accountCache) resetAfterApply(
 	logger *zap.Logger,
-	db *sql.Database,
+	db sql.StateDatabase,
 	nextNonce, newBalance uint64,
 	applied types.LayerID,
 ) error {
@@ -448,7 +448,7 @@ func groupTXsByPrincipal(logger *zap.Logger, mtxs []*types.MeshTransaction) map[
 }
 
 // buildFromScratch builds the cache from database.
-func (c *Cache) buildFromScratch(db *sql.Database) error {
+func (c *Cache) buildFromScratch(db sql.StateDatabase) error {
 	applied, err := layers.GetLastApplied(db)
 	if err != nil {
 		return fmt.Errorf("cache: get pending %w", err)
@@ -560,7 +560,7 @@ func acceptable(err error) bool {
 
 func (c *Cache) Add(
 	ctx context.Context,
-	db *sql.Database,
+	db sql.StateDatabase,
 	tx *types.Transaction,
 	received time.Time,
 	mustPersist bool,
@@ -607,7 +607,7 @@ func (c *Cache) has(tid types.TransactionID) bool {
 
 // LinkTXsWithProposal associates the transactions to a proposal.
 func (c *Cache) LinkTXsWithProposal(
-	db *sql.Database,
+	db sql.StateDatabase,
 	lid types.LayerID,
 	pid types.ProposalID,
 	tids []types.TransactionID,
@@ -618,12 +618,13 @@ func (c *Cache) LinkTXsWithProposal(
 	if err := addToProposal(db, lid, pid, tids); err != nil {
 		return fmt.Errorf("linking txs to proposal: %w", err)
 	}
-	return c.updateLayer(lid, types.EmptyBlockID, tids)
+	c.updateLayer(lid, types.EmptyBlockID, tids)
+	return nil
 }
 
 // LinkTXsWithBlock associates the transactions to a block.
 func (c *Cache) LinkTXsWithBlock(
-	db *sql.Database,
+	db sql.StateDatabase,
 	lid types.LayerID,
 	bid types.BlockID,
 	tids []types.TransactionID,
@@ -632,30 +633,30 @@ func (c *Cache) LinkTXsWithBlock(
 		return nil
 	}
 	if err := addToBlock(db, lid, bid, tids); err != nil {
-		return err
+		return fmt.Errorf("add to block: %w", err)
 	}
-	return c.updateLayer(lid, bid, tids)
+	c.updateLayer(lid, bid, tids)
+	return nil
 }
 
 // updateLayer associates the transactions to a layer and optionally a block.
 // A transaction is tagged with a layer when it's included in a proposal/block.
 // If a transaction is included in multiple proposals/blocks in different layers,
 // the lowest layer is retained.
-func (c *Cache) updateLayer(lid types.LayerID, bid types.BlockID, tids []types.TransactionID) error {
+func (c *Cache) updateLayer(lid types.LayerID, bid types.BlockID, tids []types.TransactionID) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	for _, ID := range tids {
 		if _, ok := c.cachedTXs[ID]; !ok {
 			// transaction is not considered best in its nonce group
-			return nil
+			return
 		}
 		c.cachedTXs[ID].UpdateLayerMaybe(lid, bid)
 	}
-	return nil
 }
 
-func (c *Cache) applyEmptyLayer(db *sql.Database, lid types.LayerID) error {
+func (c *Cache) applyEmptyLayer(db sql.StateDatabase, lid types.LayerID) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -674,7 +675,7 @@ func (c *Cache) applyEmptyLayer(db *sql.Database, lid types.LayerID) error {
 // ApplyLayer retires the applied transactions from the cache and updates the balances.
 func (c *Cache) ApplyLayer(
 	ctx context.Context,
-	db *sql.Database,
+	db sql.StateDatabase,
 	lid types.LayerID,
 	bid types.BlockID,
 	results []types.TransactionWithResult,
@@ -702,7 +703,7 @@ func (c *Cache) ApplyLayer(
 
 	// commit results before reporting them
 	// TODO(dshulyak) save results in vm
-	if err := db.WithTx(context.Background(), func(dbtx *sql.Tx) error {
+	if err := db.WithTx(context.Background(), func(dbtx sql.Transaction) error {
 		for _, rst := range results {
 			err := transactions.AddResult(dbtx, rst.ID, &rst.TransactionResult)
 			if err != nil {
@@ -723,7 +724,9 @@ func (c *Cache) ApplyLayer(
 				return err
 			}
 		}
-		events.ReportResult(rst)
+		if err := events.ReportResult(rst); err != nil {
+			c.logger.Error("Failed to emit tx results", zap.Stringer("tx_id", rst.ID), zap.Error(err))
+		}
 	}
 
 	for _, tx := range ineffective {
@@ -791,7 +794,7 @@ func (c *Cache) ApplyLayer(
 	return nil
 }
 
-func (c *Cache) RevertToLayer(db *sql.Database, revertTo types.LayerID) error {
+func (c *Cache) RevertToLayer(db sql.StateDatabase, revertTo types.LayerID) error {
 	if err := undoLayers(db, revertTo.Add(1)); err != nil {
 		return err
 	}
@@ -831,7 +834,7 @@ func (c *Cache) GetMempool() map[types.Address][]*NanoTX {
 }
 
 // checkApplyOrder returns an error if layers were not applied in order.
-func checkApplyOrder(logger *zap.Logger, db *sql.Database, toApply types.LayerID) error {
+func checkApplyOrder(logger *zap.Logger, db sql.StateDatabase, toApply types.LayerID) error {
 	lastApplied, err := layers.GetLastApplied(db)
 	if err != nil {
 		return fmt.Errorf("cache get last applied %w", err)
@@ -846,8 +849,8 @@ func checkApplyOrder(logger *zap.Logger, db *sql.Database, toApply types.LayerID
 	return nil
 }
 
-func addToProposal(db *sql.Database, lid types.LayerID, pid types.ProposalID, tids []types.TransactionID) error {
-	return db.WithTx(context.Background(), func(dbtx *sql.Tx) error {
+func addToProposal(db sql.StateDatabase, lid types.LayerID, pid types.ProposalID, tids []types.TransactionID) error {
+	return db.WithTx(context.Background(), func(dbtx sql.Transaction) error {
 		for _, tid := range tids {
 			if err := transactions.AddToProposal(dbtx, tid, lid, pid); err != nil {
 				return fmt.Errorf("add2prop %w", err)
@@ -857,8 +860,8 @@ func addToProposal(db *sql.Database, lid types.LayerID, pid types.ProposalID, ti
 	})
 }
 
-func addToBlock(db *sql.Database, lid types.LayerID, bid types.BlockID, tids []types.TransactionID) error {
-	return db.WithTx(context.Background(), func(dbtx *sql.Tx) error {
+func addToBlock(db sql.StateDatabase, lid types.LayerID, bid types.BlockID, tids []types.TransactionID) error {
+	return db.WithTx(context.Background(), func(dbtx sql.Transaction) error {
 		for _, tid := range tids {
 			if err := transactions.AddToBlock(dbtx, tid, lid, bid); err != nil {
 				return fmt.Errorf("add2block %w", err)
@@ -868,8 +871,8 @@ func addToBlock(db *sql.Database, lid types.LayerID, bid types.BlockID, tids []t
 	})
 }
 
-func undoLayers(db *sql.Database, from types.LayerID) error {
-	return db.WithTx(context.Background(), func(dbtx *sql.Tx) error {
+func undoLayers(db sql.StateDatabase, from types.LayerID) error {
+	return db.WithTx(context.Background(), func(dbtx sql.Transaction) error {
 		err := transactions.UndoLayers(dbtx, from)
 		if err != nil {
 			return fmt.Errorf("undo %w", err)
