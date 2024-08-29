@@ -134,6 +134,7 @@ func (h *Handler) HandleMalfeasanceProof(ctx context.Context, peer p2p.Peer, dat
 }
 
 func (h *Handler) validateAndSave(ctx context.Context, p *wire.MalfeasanceProof) (types.NodeID, error) {
+	p.SetReceived(time.Now())
 	nodeID, err := h.Validate(ctx, p)
 	switch {
 	case errors.Is(err, errUnknownProof):
